@@ -26,11 +26,10 @@ from verl.utils.reward_score.ttrl.auto_verify import auto_verify
 from verl.utils.reward_score.ttrl.ttt_metrics import (
     post_test_time_train_metrics,
     test_time_train_metrics,
-    test_time_train_metrics_adaptive,
     test_time_train_metrics_eval,
 )
 
-VARIANTS = ("sequential", "batch_sequential")
+VARIANTS = ("sequential", "batch_sequential", "sequential_replay")
 
 
 def data_source_to_task(data_source):
@@ -63,6 +62,7 @@ class TTRLRewardManager:
         eval_n_samples=1,
         variant="sequential",
         parallel_batch_size=1,
+        lookahead=16,
         adapo=None,
         log_dir=None,
     ) -> None:
@@ -75,7 +75,8 @@ class TTRLRewardManager:
         self.eval_n_samples = eval_n_samples
         assert variant in VARIANTS, f"variant must be one of {VARIANTS}, got {variant}"
         self.variant = variant
-        self.parallel_batch_size = parallel_batch_size
+        self.parallel_batch_size = parallel_batch_size  # rollout-side settings, kept for logging
+        self.lookahead = lookahead
         self.adapo_config = AdaPOConfig.from_dict(adapo)
         assert n_votes_per_prompt >= n_samples_per_prompt, f"For TTRL settings, n_votes_per_prompt {n_votes_per_prompt} should be greater than or equal to n_samples_per_prompt {n_samples_per_prompt}"
 
@@ -188,139 +189,43 @@ class TTRLRewardManager:
                 post_ttrl_info[k] = v
         return post_ttrl_info
 
-    def _compute_ttrl_reward_adaptive(self, data: DataProto, adaptive_info: dict):
-        """
-        Batch-sequential variant: rewards from the per-prompt AdaptiveStoppingState objects built
-        during generation. Prompts have a variable number of responses (one block of
-        ``prompt_to_response_count[p]`` rows per prompt); the returned reward tensor holds the
-        first N responses of every prompt.
-        """
-        reward_extra_info = defaultdict(list)
-        ttrl_info = {}
-
-        stopping_states = adaptive_info["stopping_states"]
-        prompt_to_response_count = adaptive_info["prompt_to_response_count"]
-        wallclock_per_prompt = adaptive_info["wallclock_per_prompt"]
-
-        num_prompts = len(stopping_states)
-        total_rows = sum(prompt_to_response_count)
-        assert len(data) == total_rows, f"Data length {len(data)} != total_rows {total_rows}"
-
-        reward_tensor = torch.zeros(
-            num_prompts * self.n_samples_per_prompt,
-            data.batch["responses"].shape[1],
-            dtype=torch.float32,
-            device=data.batch["responses"].device,
-        )
-
-        already_print_data_sources = {}
-        all_ttrl_metrics = defaultdict(list)
-        scores = [0.0] * total_rows
-        all_answers_data = []
-        all_confirmation_z_data = []
-
-        row_offset = 0
-        for prompt_i in range(num_prompts):
-            n_resp = prompt_to_response_count[prompt_i]
-            state = stopping_states[prompt_i]
-            assert n_resp >= self.n_samples_per_prompt, f"prompt {prompt_i} has {n_resp} < N={self.n_samples_per_prompt} responses"
-
-            data_item = data[row_offset]
-            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-            data_source = data_item.non_tensor_batch[self.reward_fn_key]
-            extra_info = data_item.non_tensor_batch.get("extra_info", {})
-            question_id = extra_info.get("index", prompt_i) if isinstance(extra_info, dict) else prompt_i
-            task = self._data_source_to_task(data_source)
-            group_extra_info = [data[row_offset + i].non_tensor_batch.get("extra_info", {}) for i in range(n_resp)]
-
-            rewards, ttrl_metrics = test_time_train_metrics_adaptive(
-                state, [ground_truth] * n_resp, task=task, extra_info=group_extra_info
-            )
-            ttrl_metrics["adaptive/wallclock_seconds"] = wallclock_per_prompt[prompt_i]
-            ttrl_metrics["adaptive/n_responses_generated"] = n_resp
-            intermediate_info = ttrl_metrics.pop("_intermediate_info", {})
-            for k, v in ttrl_metrics.items():
-                all_ttrl_metrics[k].append(v)
-
-            all_answers_data.append({
-                "question_id": question_id,
-                "extracted_answers": state.extracted_answers,
-                "ground_truth": ground_truth,
-                "data_source": data_source,
-                "n_responses_generated": n_resp,
-                "early_stopped": state.stopped,
-                "wallclock_seconds": wallclock_per_prompt[prompt_i],
-                "real_tokens": state.get_total_real_tokens(),
-            })
-            all_confirmation_z_data.append(self._confirmation_z_record(question_id, data_source, intermediate_info))
-
-            for i in range(n_resp):
-                scores[row_offset + i] = rewards[i]
-                if i < self.n_samples_per_prompt:
-                    di = data[row_offset + i]
-                    prompt_length = di.batch["prompts"].shape[-1]
-                    valid_response_length = di.batch["attention_mask"][prompt_length:].sum()
-                    reward_tensor[prompt_i * self.n_samples_per_prompt + i, valid_response_length - 1] = rewards[i]
-
-            already_print_data_sources.setdefault(data_source, 0)
-            if already_print_data_sources[data_source] < self.num_examine:
-                already_print_data_sources[data_source] += 1
-                print(f"[adaptive] prompt_i={prompt_i}, n_resp={n_resp}, early_stopped={state.stopped}, real_tokens={state.get_total_real_tokens()}")
-
-            row_offset += n_resp
-
-        data.batch["acc"] = torch.tensor(scores, dtype=torch.float32, device=data.batch["prompts"].device)
-
-        for k, v in all_ttrl_metrics.items():
-            ttrl_info[k] = np.mean(v)
-
-        ttrl_info["all_answers_data"] = all_answers_data
-        ttrl_info["all_confirmation_z_data"] = all_confirmation_z_data
-        ttrl_info["adaptive/overall_wallclock"] = adaptive_info["overall_wallclock"]
-        ttrl_info["adaptive/mean_wallclock_per_prompt"] = np.mean(wallclock_per_prompt)
-        ttrl_info["adaptive/mean_responses_per_prompt"] = np.mean(prompt_to_response_count)
-        ttrl_info["adaptive/total_real_tokens"] = sum(s.get_total_real_tokens() for s in stopping_states)
-        ttrl_info["adaptive/early_stop_rate"] = np.mean([1.0 if s.stopped else 0.0 for s in stopping_states])
-        return reward_tensor, reward_extra_info, ttrl_info
-
     def _compute_ttrl_reward(self, data: DataProto):
         """
-        Sequential variant: M responses per prompt (contiguous rows), replayed in order through
-        the AdaPO stopping rule.
+        AdaPO pseudo-labelling for all variants. ``data`` holds M (= n_votes_per_prompt) rows per prompt in
+        rollout-index order. With the early-stopping rollouts (sequential / batch_sequential) some rows were
+        never generated (``adapo_generated`` is False); with sequential_replay all M rows are generated.
+        The returned reward tensor holds the first N rows of every prompt (the rows used for the update).
         """
         reward_extra_info = defaultdict(list)
         ttrl_info = {}
+        M, N = self.n_votes_per_prompt, self.n_samples_per_prompt
+        assert len(data) % M == 0, f"Length of data {len(data)} should be divisible by n_votes_per_prompt {M}"
+        prompt_num = len(data) // M
 
-        assert len(data) % self.n_votes_per_prompt == 0, f"Length of data {len(data)} should be divisible by n_votes_per_prompt {self.n_votes_per_prompt}"
-        prompt_num = len(data) // self.n_votes_per_prompt
+        non_tensor = data.non_tensor_batch
+        generated = non_tensor.get("adapo_generated", np.ones(len(data), dtype=bool))
+        generated_tokens = non_tensor.get("adapo_generated_tokens", None)
+        worker_consumed = non_tensor.get("adapo_consumed", None)
+        wallclock = non_tensor.get("adapo_wallclock", None)
 
-        reward_tensor = torch.zeros_like(data.batch["responses"][: prompt_num * self.n_samples_per_prompt], dtype=torch.float32)
+        reward_tensor = torch.zeros_like(data.batch["responses"][: prompt_num * N], dtype=torch.float32)
         already_print_data_sources = {}
         all_ttrl_metrics = defaultdict(list)
         scores = [0.0 for _ in range(len(data))]
         all_answers_data = []
         all_confirmation_z_data = []
+        decision_mismatches = 0
 
         for prompt_i in range(prompt_num):
-            group_pred_outputs = []
-            group_prompts = []
-            group_labels = []
-            group_extra_info = []
-            group_response_lengths = []
+            rows = range(prompt_i * M, (prompt_i + 1) * M)
+            group_pred_outputs, group_prompts, group_labels, group_extra_info, group_response_lengths = [], [], [], [], []
             task = None
-
-            for i in range(self.n_votes_per_prompt):
-                data_item = data[prompt_i * self.n_votes_per_prompt + i]
+            for row in rows:
+                data_item = data[row]
                 prompt_idx = data_item.batch["prompts"]
                 prompt_length = prompt_idx.shape[-1]
                 valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
                 valid_prompt_idx = prompt_idx[-valid_prompt_length:]
-                response_idx = data_item.batch["responses"]
-                valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
-                valid_response_idx = response_idx[:valid_response_length]
-
-                prompt_str = self.tokenizer.decode(valid_prompt_idx, skip_special_tokens=False)
-                response_str = self.tokenizer.decode(valid_response_idx, skip_special_tokens=False)
                 ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
                 data_source = data_item.non_tensor_batch[self.reward_fn_key]
                 extra_info = data_item.non_tensor_batch["extra_info"]
@@ -328,9 +233,15 @@ class TTRLRewardManager:
                     task = self._data_source_to_task(data_source)
                     first_ground_truth, first_data_source = ground_truth, data_source
                     question_id = extra_info.get("index", prompt_i) if isinstance(extra_info, dict) else prompt_i
+                    prompt_str = self.tokenizer.decode(valid_prompt_idx, skip_special_tokens=False)
                 elif task != self._data_source_to_task(data_source):
                     raise NotImplementedError(f"Non consistent task {task} and {self._data_source_to_task(data_source)} for TTRLRewardManager")
 
+                if generated[row]:
+                    valid_response_length = int(data_item.batch["attention_mask"][prompt_length:].sum())
+                    response_str = self.tokenizer.decode(data_item.batch["responses"][:valid_response_length], skip_special_tokens=False)
+                else:
+                    valid_response_length, response_str = 0, None
                 group_labels.append(ground_truth)
                 group_prompts.append(prompt_str)
                 group_pred_outputs.append(response_str)
@@ -340,41 +251,53 @@ class TTRLRewardManager:
             rewards, ttrl_metrics = test_time_train_metrics(
                 group_pred_outputs,
                 group_labels,
-                n_samples_per_prompt=self.n_samples_per_prompt,
+                n_samples_per_prompt=N,
+                response_lengths=group_response_lengths,
                 task=task,
                 extra_info=group_extra_info,
-                tokenizer=self.tokenizer,
+                generated_tokens=None if generated_tokens is None else [int(generated_tokens[r]) for r in rows],
                 adapo_config=self.adapo_config,
             )
             intermediate_info = ttrl_metrics.pop("_intermediate_info", {})
+            samples_used = intermediate_info["samples_used"]
+            if worker_consumed is not None and int(sum(worker_consumed[r] for r in rows)) != samples_used:
+                decision_mismatches += 1
+            if wallclock is not None:
+                ttrl_metrics["adapo/wallclock_to_decision"] = float(wallclock[rows[0]])
             for k, v in ttrl_metrics.items():
                 all_ttrl_metrics[k].append(v)
 
+            consumed_outputs = group_pred_outputs[:samples_used]
             all_answers_data.append({
                 "question_id": question_id,
-                "extracted_answers": auto_extract(task, group_pred_outputs, extra_info=group_extra_info),
+                "extracted_answers": auto_extract(task, consumed_outputs, extra_info=group_extra_info[:samples_used]),
                 "ground_truth": first_ground_truth,
                 "data_source": first_data_source,
+                "generated_tokens": ttrl_metrics["adapo/generated_tokens"],
+                "consumed_tokens": ttrl_metrics["adapo/consumed_tokens"],
             })
             all_confirmation_z_data.append(self._confirmation_z_record(question_id, first_data_source, intermediate_info))
 
-            for i in range(self.n_votes_per_prompt):
-                if i < self.n_samples_per_prompt:
+            for i, row in enumerate(rows):
+                if i < N:
                     # reward on the last valid token of *this* response
-                    reward_tensor[prompt_i * self.n_samples_per_prompt + i, group_response_lengths[i] - 1] = rewards[i]
-                scores[prompt_i * self.n_votes_per_prompt + i] = rewards[i]
+                    reward_tensor[prompt_i * N + i, group_response_lengths[i] - 1] = rewards[i]
+                scores[row] = rewards[i]
 
-                already_print_data_sources.setdefault(first_data_source, 0)
-                if already_print_data_sources[first_data_source] < self.num_examine:
-                    already_print_data_sources[first_data_source] += 1
-                    print("[prompt]", group_prompts[i])
-                    print("[response]", group_pred_outputs[i])
-                    print("[score]", rewards[i])
+            already_print_data_sources.setdefault(first_data_source, 0)
+            if already_print_data_sources[first_data_source] < self.num_examine:
+                already_print_data_sources[first_data_source] += 1
+                print("[prompt]", group_prompts[0])
+                print("[response]", group_pred_outputs[0])
+                print("[score]", rewards[0])
 
         data.batch["acc"] = torch.tensor(scores, dtype=torch.float32, device=data.batch["prompts"].device)
 
         for k, v in all_ttrl_metrics.items():
             ttrl_info[k] = np.mean(v)
+        ttrl_info["adapo/decision_mismatch"] = decision_mismatches
+        if decision_mismatches:
+            print(f"[AdaPO] WARNING: {decision_mismatches} prompts where the replayed decision differs from the rollout worker")
 
         # Per-question traces, saved to JSON by the trainer (not logged to wandb)
         ttrl_info["all_answers_data"] = all_answers_data
@@ -482,13 +405,10 @@ class TTRLRewardManager:
             
             return reward_tensor, reward_extra_info, ttrl_info
 
-    def __call__(self, data: DataProto, return_dict=False, adaptive_info=None):
+    def __call__(self, data: DataProto, return_dict=False):
 
         if self.mode == "train":
-            if adaptive_info is not None:
-                reward_tensor, reward_extra_info, ttrl_info = self._compute_ttrl_reward_adaptive(data, adaptive_info)
-            else:
-                reward_tensor, reward_extra_info, ttrl_info = self._compute_ttrl_reward(data)
+            reward_tensor, reward_extra_info, ttrl_info = self._compute_ttrl_reward(data)
         elif self.mode == "eval":
             reward_tensor, reward_extra_info, ttrl_info = self._compute_eval_reward(data)
         else:

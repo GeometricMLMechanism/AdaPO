@@ -189,7 +189,11 @@ reward_model:
     # ---------------- AdaPO ----------------
     # n_votes_per_prompt = M (maximum rollout budget), n_samples_per_prompt = N (minimum budget,
     # also the number of rollouts used for the policy update)
-    variant: sequential # sequential | batch_sequential
+    # sequential: true early stopping, rollouts consumed one at a time in index order
+    # batch_sequential: rounds of parallel_batch_size rollouts per prompt
+    # sequential_replay: generate all M rollouts, replay them through the rule (no compute saving)
+    variant: sequential
+    lookahead: 16 # sequential only: rollouts kept submitted beyond the next rollout the rule needs
     parallel_batch_size: 8 # B_par, rollouts generated per prompt per round (batch_sequential only)
     adapo:
       alpha: 0.05 # SPRT type-I error
@@ -197,6 +201,7 @@ reward_model:
       gamma: 0.95 # posterior confidence for adaptive confirmation, Z*(gamma)
       eta: 0.6 # degradation factor: p_0 = eta * majority ratio of the first N rollouts (then frozen)
       min_num_candidates: 5 # lower bound on the number of candidate answers m
+      m_mode: dynamic # m = distinct answers so far (dynamic) or among the first N rollouts (frozen)
     log_dir: ${trainer.default_local_dir}/adapo_logs # per-question JSON traces; null to disable
 
 custom_reward_function:

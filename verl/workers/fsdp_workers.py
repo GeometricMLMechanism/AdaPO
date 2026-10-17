@@ -572,22 +572,10 @@ class ActorRolloutRefWorker(Worker):
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
 
-            adaptive_vote = prompts.meta_info.get("adaptive_vote", False)
-            if adaptive_vote:
-                n_votes = prompts.meta_info.get("n_votes_per_prompt", self.config.rollout.n_vote)
-                n_samples = prompts.meta_info.get("n_samples_per_prompt", 32)
-                parallel_batch_size = prompts.meta_info.get("parallel_batch_size", 8)
-                task = prompts.meta_info.get("task", "math")
-                output, adaptive_info = self.rollout.generate_sequences_adaptive(
-                    prompts,
-                    tokenizer=self.tokenizer,
-                    n_votes_per_prompt=n_votes,
-                    n_samples_per_prompt=n_samples,
-                    parallel_batch_size=parallel_batch_size,
-                    task=task,
-                    adapo_config=prompts.meta_info.get("adapo_config"),
-                )
-                output.meta_info["adaptive_info"] = adaptive_info
+            adapo_rollout = prompts.meta_info.get("adapo_rollout", None)
+            if adapo_rollout:
+                # AdaPO early-stopping rollout: M rows per prompt (see vLLMRollout.generate_sequences_adapo)
+                output = self.rollout.generate_sequences_adapo(prompts, tokenizer=self.tokenizer, **adapo_rollout)
             elif "do_vote" in prompts.meta_info and prompts.meta_info["do_vote"]:
                 output = self.rollout.generate_sequences(prompts, n=self.config.rollout.n_vote)
             else:

@@ -46,6 +46,9 @@ class AdaPOConfig:
     gamma: float = 0.95  # posterior confidence required by adaptive confirmation
     eta: float = 0.6  # degradation factor applied to the majority-ratio estimate of p_0
     min_num_candidates: int = 5  # lower bound on the number of candidate answers m
+    # number of candidates m: "dynamic" = distinct answers seen so far (updated every rollout),
+    # "frozen" = distinct answers among the first N rollouts (estimated once, like p_0)
+    m_mode: str = "dynamic"
 
     @classmethod
     def from_dict(cls, cfg: Optional[dict]) -> "AdaPOConfig":
@@ -102,8 +105,10 @@ class AdaPOStoppingRule:
         self.answers: List[Optional[Hashable]] = []  # extracted answers consumed so far
         self.vote_counts: Counter = Counter()
         self.leader_confirmations: Counter = Counter()
-        # p_0 estimated from the first n_min rollouts, then frozen
+        # p_0 (and m in "frozen" mode) estimated from the first n_min rollouts, then frozen
         self.p0: Optional[float] = None
+        self.m0: Optional[int] = None
+        assert self.config.m_mode in ("dynamic", "frozen"), self.config.m_mode
 
         self.stopped = False
         self.stopping_answer = None
@@ -154,9 +159,11 @@ class AdaPOStoppingRule:
 
         if n == self.n_min:
             self.p0 = self._estimate_p0()  # estimated once, frozen afterwards
+            self.m0 = len(self.vote_counts)
             self.n_min_answer = self._majority()
 
-        m = max(len(self.vote_counts), self.config.min_num_candidates)
+        num_candidates = len(self.vote_counts) if self.config.m_mode == "dynamic" else self.m0
+        m = max(num_candidates, self.config.min_num_candidates)
         kappa = compute_kappa(self.p0, m)
         z_star = compute_required_confirmations(kappa, self.config.alpha, self.config.beta, self.config.gamma)
         self.required_confirmations = z_star

@@ -54,6 +54,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.tracking import ValidationGenerationsLogger
 
 WorkerType = Type[Worker]
+ADAPO_VARIANTS = ("sequential", "batch_sequential", "sequential_replay")
 
 
 class Role(Enum):
@@ -320,27 +321,27 @@ class RayPPOTrainer:
             self.n_samples_per_prompt = self.config.reward_model.reward_kwargs.n_samples_per_prompt
             self.n_votes_per_prompt = self.config.reward_model.reward_kwargs.n_votes_per_prompt
             reward_kwargs = self.config.reward_model.reward_kwargs
-            # AdaPO variant: "sequential" replays M rollouts one at a time through the stopping rule,
-            # "batch_sequential" generates rollouts in rounds of `parallel_batch_size` and stops per prompt.
+            # AdaPO variant (see README):
+            #   sequential        - true early stopping, rollouts consumed one at a time (stream scheduler)
+            #   batch_sequential  - rounds of `parallel_batch_size` rollouts per prompt
+            #   sequential_replay - generate all M rollouts, replay them through the rule (no compute saving)
             self.adapo_variant = reward_kwargs.get("variant", "sequential")
-            assert self.adapo_variant in ("sequential", "batch_sequential"), f"Unknown AdaPO variant {self.adapo_variant}"
-            self.use_adaptive_rollout = self.adapo_variant == "batch_sequential"
-            self.parallel_batch_size = reward_kwargs.get("parallel_batch_size", 8)
+            assert self.adapo_variant in ADAPO_VARIANTS, f"Unknown AdaPO variant {self.adapo_variant}"
             adapo_cfg = reward_kwargs.get("adapo", None)
             self.adapo_config = OmegaConf.to_container(adapo_cfg, resolve=True) if adapo_cfg is not None else {}
             self.adapo_log_dir = reward_kwargs.get("log_dir", None)
-            if self.use_adaptive_rollout:
-                n_rollout_workers = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-                if n_rollout_workers != 1:
-                    raise NotImplementedError(
-                        "The batch-sequential AdaPO variant produces a variable number of responses per prompt and "
-                        "currently supports a single rollout worker (trainer.n_gpus_per_node=1, trainer.nnodes=1). "
-                        "Use variant=sequential for multi-GPU runs."
-                    )
+            self.adapo_rollout_kwargs = None
+            if self.adapo_variant != "sequential_replay":
+                self.adapo_rollout_kwargs = {
+                    "n_votes_per_prompt": self.n_votes_per_prompt,
+                    "n_samples_per_prompt": self.n_samples_per_prompt,
+                    "policy": "stream" if self.adapo_variant == "sequential" else "rounds",
+                    "lookahead": reward_kwargs.get("lookahead", 16),
+                    "parallel_batch_size": reward_kwargs.get("parallel_batch_size", 8),
+                    "adapo_config": self.adapo_config,
+                }
         else:
             self.use_ttrl = False
-            self.use_adaptive_rollout = False
-            self.parallel_batch_size = 8
             self.adapo_log_dir = None
 
         self._validate_config()
@@ -903,63 +904,32 @@ class RayPPOTrainer:
 
         return data[selected_indices]
 
-    def _select_top_k_adaptive(self, data, adaptive_info, n_samples_per_prompt):
-        """Select top-k samples per prompt for training when prompts have variable response counts."""
-        prompt_counts = adaptive_info["prompt_to_response_count"]
-        selected_indices = []
-        offset = 0
-        for count in prompt_counts:
-            k = min(n_samples_per_prompt, count)
-            selected_indices.extend(range(offset, offset + k))
-            offset += count
-        return data[selected_indices]
-    
-    def _save_adaptive_metrics(self, epoch, step, adaptive_info, ttrl_metrics):
-        """Save adaptive rollout metrics to a JSON file."""
-        import json
-        if not self.adapo_log_dir:
-            return
-        output_dir = self.adapo_log_dir
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, "adaptive_rollout_metrics.json")
-        
-        if os.path.exists(filepath):
-            with open(filepath, 'r') as f:
-                all_metrics = json.load(f)
-        else:
-            all_metrics = {}
-        
-        epoch_key = f"epoch_{epoch}"
-        step_key = f"step_{step}"
-        
-        if epoch_key not in all_metrics:
-            all_metrics[epoch_key] = {}
-        
-        stopping_states = adaptive_info["stopping_states"]
-        per_prompt_data = []
-        for i, state in enumerate(stopping_states):
-            per_prompt_data.append({
-                "prompt_index": i,
-                "total_completions": state.get_total_completions(),
-                "total_real_tokens": state.get_total_real_tokens(),
-                "early_stopped": state.stopped,
-                "stopping_sample_idx": state.stopping_sample_idx,
-                "wallclock_seconds": adaptive_info["wallclock_per_prompt"][i],
-            })
-        
-        all_metrics[epoch_key][step_key] = {
-            "overall_wallclock": adaptive_info["overall_wallclock"],
-            "prompt_to_response_count": adaptive_info["prompt_to_response_count"],
-            "total_real_tokens": sum(s.get_total_real_tokens() for s in stopping_states),
-            "total_completions": sum(s.get_total_completions() for s in stopping_states),
-            "early_stop_rate": sum(1 for s in stopping_states if s.stopped) / len(stopping_states),
-            "per_prompt": per_prompt_data,
-        }
-        
-        with open(filepath, 'w') as f:
-            json.dump(all_metrics, f, indent=2)
-        
-        print(f"Saved adaptive rollout metrics to {filepath} (epoch={epoch}, step={step})")
+    def _ttrl_label_and_select(self, batch: DataProto, epoch: int, metrics: dict) -> DataProto:
+        """
+        AdaPO / TTRL step on the full rollout batch (M rows per prompt, rollout-index order):
+        elect pseudo-labels with the stopping rule, reward the rollouts, log the traces, and keep the
+        first N rollouts of every prompt for the policy update.
+        """
+        num_prompts = len(batch) // self.n_votes_per_prompt
+        reward_result = self.reward_fn(batch, return_dict=True)
+        ttrl_metrics = reward_result["ttrl_info"]
+        answers_data = ttrl_metrics.pop("all_answers_data", None)
+        if answers_data is not None:
+            self.reward_fn.save_answers_to_file(epoch=epoch, step=self.global_steps, answers_data=answers_data)
+        confirmation_z_data = ttrl_metrics.pop("all_confirmation_z_data", None)
+        if confirmation_z_data is not None:
+            self.reward_fn.save_confirmation_z_to_file(epoch=epoch, step=self.global_steps, confirmation_z_data=confirmation_z_data)
+        for k, v in ttrl_metrics.items():
+            metrics[f"train/{k}"] = v
+
+        batch = self._select_top_k_per_prompt(batch, self.n_votes_per_prompt, self.n_samples_per_prompt)
+        self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
+        assert len(batch) == num_prompts * self.n_samples_per_prompt
+        batch.batch["token_level_scores"] = reward_result["reward_tensor"]
+
+        for k, v in self.reward_fn.compute_post_ttrl_metrics(batch).items():
+            metrics[f"train/{k}"] = v
+        return batch
 
     def fit(self):
         """
@@ -1012,26 +982,18 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 batch.meta_info["do_vote"] = False
-                adaptive_info = None
+                batch.meta_info["adapo_rollout"] = None
                 if self.use_ttrl:
-                    if self.use_adaptive_rollout:
-                        batch.meta_info["adaptive_vote"] = True
-                        batch.meta_info["n_votes_per_prompt"] = self.n_votes_per_prompt
-                        batch.meta_info["n_samples_per_prompt"] = self.n_samples_per_prompt
-                        batch.meta_info["parallel_batch_size"] = self.parallel_batch_size
-                        batch.meta_info["adapo_config"] = self.adapo_config
+                    if self.adapo_rollout_kwargs is not None:
                         from verl.workers.reward_manager.ttrl import data_source_to_task
-                        batch.meta_info["task"] = data_source_to_task(batch.non_tensor_batch[self.config.data.reward_fn_key][0])
+
+                        task = data_source_to_task(batch.non_tensor_batch[self.config.data.reward_fn_key][0])
+                        batch.meta_info["adapo_rollout"] = {**self.adapo_rollout_kwargs, "task": task}
                     else:
                         self.config.actor_rollout_ref.rollout.n = self.n_votes_per_prompt
                         batch.meta_info["do_vote"] = True
+                meta_info_keys_to_pop = ["do_vote", "adapo_rollout"]
 
-                meta_info_keys_to_pop = []
-                if self.use_ttrl and self.use_adaptive_rollout:
-                    meta_info_keys_to_pop = ["adaptive_vote", "n_votes_per_prompt", "n_samples_per_prompt", "parallel_batch_size", "task", "adapo_config"]
-                elif self.use_ttrl:
-                    meta_info_keys_to_pop = ["do_vote"]
-                
                 # pop those keys for generation
                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
@@ -1052,15 +1014,7 @@ class RayPPOTrainer:
                     # generate a batch
                     with _timer("gen", timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        
-                        if self.use_ttrl and self.use_adaptive_rollout:
-                            adaptive_info = gen_batch_output.meta_info.get("adaptive_info", None)
-                            if adaptive_info:
-                                prompt_counts = adaptive_info["prompt_to_response_count"]
-                                total_generated = sum(prompt_counts)
-                                print(f"[Adaptive] Generated {total_generated} total responses for {len(prompt_counts)} prompts. "
-                                      f"Per-prompt: {prompt_counts}, Early-stop rate: {np.mean([st.stopped for st in adaptive_info['stopping_states']]):.3f}")
-                        elif self.use_ttrl:
+                        if self.use_ttrl:
                             assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
@@ -1082,23 +1036,14 @@ class RayPPOTrainer:
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                     )
                     
-                    if self.use_ttrl and self.use_adaptive_rollout and adaptive_info:
-                        prompt_counts = adaptive_info["prompt_to_response_count"]
-                        num_prompts_adaptive = len(prompt_counts)
-                        adaptive_index_to_pos = {}
-                        for p_i in range(num_prompts_adaptive):
-                            idx_val = batch[p_i].non_tensor_batch["extra_info"]["index"]
-                            adaptive_index_to_pos[idx_val] = p_i
-                        
-                        repeat_counts = []
-                        for c in prompt_counts:
-                            repeat_counts.append(c)
-                        
-                        expanded_indices = []
-                        for i, c in enumerate(repeat_counts):
-                            expanded_indices.extend([i] * c)
-                        batch = batch[expanded_indices]
+                    if self.use_ttrl:
+                        # rows are prompt-major / rollout-index-minor (M per prompt), as produced by the rollout
+                        batch = batch.repeat(repeat_times=self.n_votes_per_prompt, interleave=True)
                         batch = batch.union(gen_batch_output)
+                        # label + reward on all M rollouts, keep the first N for the update. Done before any
+                        # reordering (balance_batch) so that rollout order is the generation order.
+                        with _timer("adapo_label", timing_raw):
+                            batch = self._ttrl_label_and_select(batch, epoch, metrics)
                     else:
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
@@ -1143,117 +1088,26 @@ class RayPPOTrainer:
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
-                        if self.use_ttrl:
-                            sorted_indices = sorted(range(len(batch)), key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"])
-                            batch = batch[sorted_indices]
-                            
-                            if self.use_adaptive_rollout and adaptive_info:
-                                sorted_prompt_order = []
-                                seen_indices = set()
-                                for row_i in range(len(batch)):
-                                    idx_val = batch[row_i].non_tensor_batch["extra_info"]["index"]
-                                    if idx_val not in seen_indices:
-                                        seen_indices.add(idx_val)
-                                        sorted_prompt_order.append(idx_val)
-                                
-                                perm = [adaptive_index_to_pos[idx_val] for idx_val in sorted_prompt_order]
-                                
-                                orig_prompt_counts = adaptive_info["prompt_to_response_count"]
-                                orig_stopping_states = adaptive_info["stopping_states"]
-                                orig_wallclock = adaptive_info["wallclock_per_prompt"]
-                                orig_token_counts = adaptive_info["all_token_counts_per_prompt"]
-                                
-                                adaptive_info["prompt_to_response_count"] = [orig_prompt_counts[i] for i in perm]
-                                adaptive_info["stopping_states"] = [orig_stopping_states[i] for i in perm]
-                                adaptive_info["wallclock_per_prompt"] = [orig_wallclock[i] for i in perm]
-                                adaptive_info["all_token_counts_per_prompt"] = [orig_token_counts[i] for i in perm]
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        if not self.use_ttrl:  # AdaPO rewards are computed in _ttrl_label_and_select
+                            if self.use_rm:
+                                # we first compute reward model score
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
 
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        try:
-                            if self.use_ttrl and self.use_adaptive_rollout and adaptive_info:
-                                reward_result = self.reward_fn(batch, return_dict=True, adaptive_info=adaptive_info)
-                            else:
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            try:
                                 reward_result = self.reward_fn(batch, return_dict=True)
-                            reward_tensor = reward_result["reward_tensor"]
-                            reward_extra_infos_dict = reward_result["reward_extra_info"]
-                            if self.use_ttrl:
-                                from copy import deepcopy
-                                ttrl_metrics = reward_result["ttrl_info"]
-                                
-                                # Save all answers to JSON file instead of wandb
-                                if 'all_answers_data' in ttrl_metrics:
-                                    answers_data = ttrl_metrics.pop('all_answers_data')
-                                    self.reward_fn.save_answers_to_file(
-                                        epoch=epoch,
-                                        step=self.global_steps,
-                                        answers_data=answers_data
-                                    )
-                                
-                                # Save confirmation Z data to JSON file
-                                if 'all_confirmation_z_data' in ttrl_metrics:
-                                    confirmation_z_data = ttrl_metrics.pop('all_confirmation_z_data')
-                                    self.reward_fn.save_confirmation_z_to_file(
-                                        epoch=epoch,
-                                        step=self.global_steps,
-                                        confirmation_z_data=confirmation_z_data
-                                    )
-                                
-                                # Save adaptive rollout metrics to JSON
-                                if self.use_adaptive_rollout and adaptive_info:
-                                    self._save_adaptive_metrics(
-                                        epoch=epoch,
-                                        step=self.global_steps,
-                                        adaptive_info=adaptive_info,
-                                        ttrl_metrics=ttrl_metrics,
-                                    )
-                                
-                                for k, v in ttrl_metrics.items():
-                                    metrics.update({f"train/{k}": v})
-                                
-                                # Down Sampling for training
-                                if self.use_adaptive_rollout and adaptive_info:
-                                    batch = self._select_top_k_adaptive(
-                                        batch, adaptive_info, self.n_samples_per_prompt
-                                    )
-                                    self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
-                                else:
-                                    batch = self._select_top_k_per_prompt(batch, self.n_votes_per_prompt, self.n_samples_per_prompt)
-                                    self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
-
-                                # Recompute ttrl metrics
-                                post_reward_result = self.reward_fn.compute_post_ttrl_metrics(batch)
-                                for k, v in post_reward_result.items():
-                                    metrics.update({f"train/{k}": v})
-
-                                # Recompute Entropy
-                                post_entropy_loss = agg_loss(
-                                    loss_mat=batch.batch["entropys"], loss_mask=batch.batch["response_mask"], loss_agg_mode=loss_agg_mode
-                                )
-                                metrics.update({"train/post_entropy": post_entropy_loss.detach().item()})
-                                
-                        except Exception as e:
-                            print(f"Error in reward_fn: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            if self.use_ttrl and self.use_adaptive_rollout and adaptive_info:
-                                reward_tensor = self.reward_fn(batch, adaptive_info=adaptive_info)
-                            else:
+                                reward_tensor = reward_result["reward_tensor"]
+                                reward_extra_infos_dict = reward_result["reward_extra_info"]
+                            except Exception as e:
+                                print(f"Error in reward_fn: {e}")
                                 reward_tensor = self.reward_fn(batch)
-                            reward_extra_infos_dict = {}
+                                reward_extra_infos_dict = {}
 
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if self.use_ttrl:
-                            self._balance_batch(batch, metrics=metrics)
-
-                        print(f"{list(reward_extra_infos_dict.keys())=}")
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            batch.batch["token_level_scores"] = reward_tensor
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1323,13 +1177,8 @@ class RayPPOTrainer:
                 metrics["ttrl/cumulative_completions"] = TokenTracker.total_completions
                 metrics["ttrl/cumulative_questions"] = TokenTracker.total_question
                 
-                if self.use_ttrl and self.use_adaptive_rollout and adaptive_info:
-                    metrics["ttrl/adaptive_overall_wallclock"] = adaptive_info["overall_wallclock"]
-                    metrics["ttrl/adaptive_mean_responses"] = np.mean(adaptive_info["prompt_to_response_count"])
-                    stopping_states = adaptive_info["stopping_states"]
-                    metrics["ttrl/adaptive_early_stop_rate"] = np.mean([1.0 if s.stopped else 0.0 for s in stopping_states])
-                    metrics["ttrl/adaptive_total_real_tokens_this_step"] = sum(s.get_total_real_tokens() for s in stopping_states)
-                    metrics["ttrl/adaptive_mean_real_tokens_per_prompt"] = np.mean([s.get_total_real_tokens() for s in stopping_states])
+                metrics["ttrl/cumulative_generated_tokens"] = TokenTracker.total_generated_tokens
+                metrics["ttrl/cumulative_generated_completions"] = TokenTracker.total_generated_completions
 
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -1345,7 +1194,8 @@ class RayPPOTrainer:
                         if TokenTracker.total_question > 0:
                             print(f"Average tokens per question: {TokenTracker.total_tokens/TokenTracker.total_question:.1f}")
                             print(f"Average completions per question: {TokenTracker.total_completions/TokenTracker.total_question:.1f}")
-                        print(f"AdaPO variant: {self.adapo_variant}" + (f" (parallel_batch_size={self.parallel_batch_size})" if self.use_adaptive_rollout else ""))
+                        print(f"Total generated tokens (incl. speculative / aborted): {TokenTracker.total_generated_tokens:,}")
+                        print(f"AdaPO variant: {self.adapo_variant}")
                         if self.adapo_log_dir:
                             saved = TokenTracker.save_all(self.adapo_log_dir)
                             print(f"Saved {', '.join(saved)} to {self.adapo_log_dir}")

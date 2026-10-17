@@ -77,3 +77,12 @@ def test_batch_sequential_matches_sequential_stopping_point(batch_size):
             if batch.update_batch(answers[start : start + batch_size]):
                 break
         assert (batch.stopped, batch.samples_used(), batch.final_answer()) == (seq.stopped, seq.samples_used(), seq.final_answer())
+
+
+def test_frozen_m_uses_first_n_rollouts():
+    # 2 candidates in the first N; many new candidates appear afterwards
+    answers = ["a"] * 6 + ["b"] * 2 + ["c", "d", "e", "f", "g", "h"] + ["a"] * 50
+    dynamic = run_sequential(answers, n_min=8, config=AdaPOConfig(m_mode="dynamic", min_num_candidates=2))
+    frozen = run_sequential(answers, n_min=8, config=AdaPOConfig(m_mode="frozen", min_num_candidates=2))
+    assert set(frozen.m_history) == {2}
+    assert max(dynamic.m_history) > 2

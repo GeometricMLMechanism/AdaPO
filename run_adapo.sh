@@ -18,11 +18,12 @@ Required:
   --task TASK                 AIME | AMC | MATH | GPQA
 
 Options:
-  --variant VARIANT           sequential (default) | batch_sequential
+  --variant VARIANT           sequential (default) | batch_sequential | sequential_replay
   --adv ESTIMATOR             grpo (default) | gae (PPO) | reinforce_plus_plus
   --max-rollouts M            maximum rollout budget per prompt (default: 64)
   --min-rollouts N            minimum rollout budget per prompt, also used for the update (default: 32)
-  --parallel-batch-size B     rollouts per prompt per round, batch_sequential only (default: 8)
+  --lookahead L               rollouts kept in flight beyond the stopping-rule frontier, sequential only (default: 16)
+  --parallel-batch-size B     rollouts per prompt per round, batch_sequential only (default: 16)
   --eta ETA                   degradation factor for p_0 (default: 0.6)
   --gamma GAMMA               confidence level of adaptive confirmation (default: 0.95)
   --alpha ALPHA / --beta BETA SPRT error rates (default: 0.05 / 0.05)
@@ -36,7 +37,7 @@ EOF
 }
 
 MODEL="" TASK_NAME="" VARIANT="sequential" ADVANTAGE="grpo"
-N_VOTES_PER_PROMPT=64 N_SAMPLES_PER_PROMPT=32 PARALLEL_BATCH_SIZE=8
+N_VOTES_PER_PROMPT=64 N_SAMPLES_PER_PROMPT=32 PARALLEL_BATCH_SIZE=8 LOOKAHEAD=16
 ETA=0.6 GAMMA=0.95 ALPHA=0.05 BETA=0.05
 EPISODE="" N_GPUS="" MODEL_PATH="" PROJECT="AdaPO" LOGGER="['console','wandb']"
 
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --max-rollouts) N_VOTES_PER_PROMPT="$2"; shift 2 ;;
     --min-rollouts) N_SAMPLES_PER_PROMPT="$2"; shift 2 ;;
     --parallel-batch-size) PARALLEL_BATCH_SIZE="$2"; shift 2 ;;
+    --lookahead) LOOKAHEAD="$2"; shift 2 ;;
     --eta) ETA="$2"; shift 2 ;;
     --gamma) GAMMA="$2"; shift 2 ;;
     --alpha) ALPHA="$2"; shift 2 ;;
@@ -69,10 +71,10 @@ if [[ -z "$MODEL" || -z "$TASK_NAME" ]]; then usage; exit 1; fi
 # ---------------- model presets ----------------
 SUFFIX_PROMPT='"\nPlease reason step by step, and put your final answer within \boxed{}."'
 case "$MODEL" in
-  qwen2.5-math-1.5b) HF_ID="Qwen/Qwen2.5-Math-1.5B";         TEMPERATURE=1.0; TP=1; GPUS=1; GPU_MEM=0.7; SUFFIX_PROMPT="" ;;
-  qwen2.5-7b)        HF_ID="Qwen/Qwen2.5-7B";                TEMPERATURE=0.6; TP=4; GPUS=4; GPU_MEM=0.6 ;;
-  llama3.2-1b)       HF_ID="meta-llama/Llama-3.2-1B-Instruct"; TEMPERATURE=0.6; TP=1; GPUS=1; GPU_MEM=0.7 ;;
-  llama3.1-8b)       HF_ID="meta-llama/Llama-3.1-8B-Instruct"; TEMPERATURE=0.6; TP=4; GPUS=4; GPU_MEM=0.7 ;;
+  qwen2.5-math-1.5b) HF_ID="Qwen/Qwen2.5-Math-1.5B";           TP=1; GPUS=1; GPU_MEM=0.7; SUFFIX_PROMPT="" ;;
+  qwen2.5-7b)        HF_ID="Qwen/Qwen2.5-7B";                  TP=4; GPUS=4; GPU_MEM=0.6 ;;
+  llama3.2-1b)       HF_ID="meta-llama/Llama-3.2-1B-Instruct"; TP=1; GPUS=1; GPU_MEM=0.7 ;;
+  llama3.1-8b)       HF_ID="meta-llama/Llama-3.1-8B-Instruct"; TP=4; GPUS=4; GPU_MEM=0.7 ;;
   *) echo "Unknown model preset: $MODEL" >&2; exit 1 ;;
 esac
 MODEL_PATH="${MODEL_PATH:-$HF_ID}"
@@ -92,15 +94,14 @@ TASK="${TASK_NAME}-TTT"
 EPISODE="${EPISODE:-$DEFAULT_EPISODE}"
 
 case "$VARIANT" in
-  sequential|batch_sequential) ;;
+  sequential|batch_sequential|sequential_replay) ;;
   *) echo "Unknown variant: $VARIANT" >&2; exit 1 ;;
 esac
-if [[ "$VARIANT" == "batch_sequential" && "$N_GPUS" -ne 1 ]]; then
-  echo "The batch_sequential variant currently supports a single GPU (got --gpus $N_GPUS)." >&2
-  exit 1
-fi
 
 MAX_RESPONSE_LENGTH=3072
+# rollout sampling (training and validation): temperature 0.6, nucleus p = 0.95
+TEMPERATURE=0.6
+TOP_P=0.95
 VAL_N=16
 MINI_BATCH_SIZE=1
 MICRO_BATCH_SIZE=2
@@ -131,6 +132,7 @@ python -m verl.trainer.main_ppo \
   reward_model.reward_kwargs.n_votes_per_prompt=$N_VOTES_PER_PROMPT \
   reward_model.reward_kwargs.variant=$VARIANT \
   reward_model.reward_kwargs.parallel_batch_size=$PARALLEL_BATCH_SIZE \
+  reward_model.reward_kwargs.lookahead=$LOOKAHEAD \
   reward_model.reward_kwargs.adapo.alpha=$ALPHA \
   reward_model.reward_kwargs.adapo.beta=$BETA \
   reward_model.reward_kwargs.adapo.gamma=$GAMMA \
@@ -159,6 +161,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.temperature=$TEMPERATURE \
+  actor_rollout_ref.rollout.top_p=$TOP_P \
   actor_rollout_ref.rollout.enforce_eager=False \
   actor_rollout_ref.rollout.free_cache_engine=False \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
@@ -169,8 +172,8 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.n=$N_SAMPLES_PER_PROMPT \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
   actor_rollout_ref.rollout.val_kwargs.n=$VAL_N \
-  actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+  actor_rollout_ref.rollout.val_kwargs.top_p=$TOP_P \
+  actor_rollout_ref.rollout.val_kwargs.temperature=$TEMPERATURE \
   actor_rollout_ref.rollout.max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
   actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
   critic.optim.lr=9e-6 \

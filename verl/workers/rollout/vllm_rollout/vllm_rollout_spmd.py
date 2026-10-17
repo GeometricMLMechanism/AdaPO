@@ -26,8 +26,8 @@ When working with Megatron:
 """
 
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
-import time
+from copy import deepcopy
+from typing import Any, List, Optional, Union
 
 import numpy as np
 import torch
@@ -317,243 +317,132 @@ class vLLMRollout(BaseRollout):
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
     @torch.no_grad()
-    def generate_sequences_adaptive(
+    def generate_sequences_adapo(
         self,
         prompts: DataProto,
         tokenizer,
         n_votes_per_prompt: int,
         n_samples_per_prompt: int,
-        parallel_batch_size: int,
         task: str = "math",
+        policy: str = "stream",
+        lookahead: int = 16,
+        parallel_batch_size: int = 8,
         adapo_config: Optional[dict] = None,
-        **kwargs,
-    ) -> Tuple[DataProto, Dict[str, Any]]:
+    ) -> DataProto:
         """
-        AdaPO batch-sequential rollout (Algorithm 1, batch-sequential variant).
+        AdaPO rollout with true early stopping (see ``adapo_rollout.py``).
 
-        In every round, each still-active prompt receives min(parallel_batch_size, M - n_p)
-        generation slots in a single vLLM call. The AdaPO stopping rule then consumes the new
-        answers of every prompt in order; prompts whose rule fired, or that reached
-        M = `n_votes_per_prompt` responses, are removed from the active set.
+        Returns exactly ``n_votes_per_prompt`` (M) rows per prompt, in prompt-major / rollout-index
+        order, so the output can be split and concatenated across DP / TP ranks like a regular
+        ``n=M`` rollout. Rows of rollouts that were never generated (or aborted) have an empty
+        response and a zero response attention mask. Per-row non-tensor fields:
 
-        Returns:
-            Tuple of (DataProto with all generated responses, adaptive_info dict)
-            adaptive_info contains per-prompt metadata: token counts, wallclock times,
-            stopping states, and the AdaptiveStoppingState objects.
+        * ``adapo_generated``: the response was fully generated
+        * ``adapo_generated_tokens``: tokens decoded for this rollout (including aborted partial ones)
+        * ``adapo_consumed``: the rollout was consumed by the stopping rule in the worker
+        * ``adapo_wallclock``: seconds until the prompt's stopping decision
         """
+        from vllm.sampling_params import RequestOutputKind
+
         from verl.utils.reward_score.ttrl.adapo import AdaPOConfig
-        from verl.utils.reward_score.ttrl.ttt_metrics import AdaptiveStoppingState
+        from verl.utils.reward_score.ttrl.auto_extract import auto_extract
+        from verl.workers.rollout.vllm_rollout.adapo_rollout import AdaPORolloutScheduler, response_valid_length
 
-        adapo_config = AdaPOConfig.from_dict(adapo_config)
-        
         idx = prompts.batch["input_ids"]
         attention_mask = prompts.batch["attention_mask"]
         position_ids = prompts.batch["position_ids"]
         eos_token_id = prompts.meta_info["eos_token_id"]
         num_prompts = idx.size(0)
-        
+        M = n_votes_per_prompt
+
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(num_prompts)], dtype=object
             )
-        
         if "multi_modal_data" in non_tensor_batch:
-            all_vllm_inputs = []
-            raw_ids_list = list(non_tensor_batch.pop("raw_prompt_ids"))
-            mm_list = list(non_tensor_batch.pop("multi_modal_data"))
-            for raw_prompt_ids, multi_modal_data in zip(raw_ids_list, mm_list):
-                all_vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
-        else:
-            raw_ids_list = list(non_tensor_batch.pop("raw_prompt_ids"))
-            all_vllm_inputs = [
-                {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in raw_ids_list
+            vllm_inputs = [
+                {"prompt_token_ids": list(raw), "multi_modal_data": mm}
+                for raw, mm in zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"))
             ]
-        
-        for input_data in all_vllm_inputs:
-            if isinstance(input_data["prompt_token_ids"], np.ndarray):
-                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
-            elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(
-                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
-                )
-        
-        stopping_states = [
-            AdaptiveStoppingState(n_samples_per_prompt, task, adapo_config) for _ in range(num_prompts)
-        ]
-        
-        all_responses_per_prompt = [[] for _ in range(num_prompts)]
-        all_token_counts_per_prompt = [[] for _ in range(num_prompts)]
-        prompt_done = [False] * num_prompts
-        wallclock_per_prompt = [0.0] * num_prompts
-        prompt_start_times = [time.time()] * num_prompts
-        
-        total_generated_so_far = [0] * num_prompts
-        overall_start_time = time.time()
-        
-        max_batches = (n_votes_per_prompt + parallel_batch_size - 1) // parallel_batch_size
-        
-        for batch_round in range(max_batches):
-            active_prompt_indices = [p for p in range(num_prompts) if not prompt_done[p]]
-            if not active_prompt_indices:
-                break
-            
-            remaining = {
-                p: min(parallel_batch_size, n_votes_per_prompt - total_generated_so_far[p])
-                for p in active_prompt_indices
-            }
-            
-            batch_vllm_inputs = []
-            batch_prompt_map = []
-            for p in active_prompt_indices:
-                n_this = remaining[p]
-                if n_this <= 0:
-                    prompt_done[p] = True
-                    continue
-                for _ in range(n_this):
-                    batch_vllm_inputs.append(all_vllm_inputs[p])
-                    batch_prompt_map.append(p)
-            
-            if not batch_vllm_inputs:
-                break
-            
-            gen_kwargs = {
-                "n": 1,
-                "max_tokens": self.config.response_length,
-            }
-            if vllm_version != "0.3.1":
-                gen_kwargs["detokenize"] = True
-            for k in self.config.keys():
-                if hasattr(SamplingParams(), str(k)):
-                    gen_kwargs[k] = self.config.get(k)
-            gen_kwargs["n"] = 1
-            gen_kwargs["detokenize"] = True
-            batch_sampling_params = SamplingParams(**gen_kwargs)
-            
-            batch_start = time.time()
-            outputs = self.inference_engine.generate(
-                prompts=batch_vllm_inputs,
-                sampling_params=batch_sampling_params,
-                use_tqdm=False,
-            )
-            batch_elapsed = time.time() - batch_start
-            
-            per_prompt_responses = {p: [] for p in active_prompt_indices}
-            per_prompt_token_ids = {p: [] for p in active_prompt_indices}
-            per_prompt_token_counts = {p: [] for p in active_prompt_indices}
-            per_prompt_texts = {p: [] for p in active_prompt_indices}
-            
-            for out_idx, output in enumerate(outputs):
-                p = batch_prompt_map[out_idx]
-                resp_out = output.outputs[0]
-                token_ids = resp_out.token_ids
-                text = resp_out.text if resp_out.text else tokenizer.decode(list(token_ids), skip_special_tokens=False)
-                real_token_count = len(token_ids)
-                
-                per_prompt_responses[p].append(list(token_ids))
-                per_prompt_token_ids[p].append(token_ids)
-                per_prompt_token_counts[p].append(real_token_count)
-                per_prompt_texts[p].append(text)
-            
-            for p in active_prompt_indices:
-                if prompt_done[p]:
-                    continue
-                
-                wallclock_per_prompt[p] += batch_elapsed
-                
-                all_responses_per_prompt[p].extend(per_prompt_responses[p])
-                all_token_counts_per_prompt[p].extend(per_prompt_token_counts[p])
-                total_generated_so_far[p] += len(per_prompt_responses[p])
-                
-                should_stop = stopping_states[p].process_batch(
-                    per_prompt_texts[p], per_prompt_token_counts[p]
-                )
-                
-                if should_stop:
-                    prompt_done[p] = True
-                    wallclock_per_prompt[p] = time.time() - prompt_start_times[p]
-                elif total_generated_so_far[p] >= n_votes_per_prompt:
-                    prompt_done[p] = True
-                    wallclock_per_prompt[p] = time.time() - prompt_start_times[p]
-        
-        overall_wallclock = time.time() - overall_start_time
-        
-        for p in range(num_prompts):
-            if wallclock_per_prompt[p] == 0:
-                wallclock_per_prompt[p] = overall_wallclock
-        
-        max_responses = max(len(r) for r in all_responses_per_prompt)
-        
-        all_idx = []
-        all_response_tensor_list = []
-        all_attention_mask_list = []
-        all_position_ids_list = []
-        prompt_to_response_count = []
-        
-        for p in range(num_prompts):
-            n_resp = len(all_responses_per_prompt[p])
-            prompt_to_response_count.append(n_resp)
-            for resp_tokens in all_responses_per_prompt[p]:
-                all_response_tensor_list.append(resp_tokens)
-                all_idx.append(idx[p])
-                all_attention_mask_list.append(attention_mask[p])
-                all_position_ids_list.append(position_ids[p])
-        
-        total_rows = sum(prompt_to_response_count)
-        
-        response_tensor = pad_2d_list_to_length(
-            all_response_tensor_list, self.pad_token_id, max_length=self.config.response_length
-        ).to(idx.device)
-        
-        stacked_idx = torch.stack(all_idx, dim=0)
-        stacked_attention_mask = torch.stack(all_attention_mask_list, dim=0)
-        stacked_position_ids = torch.stack(all_position_ids_list, dim=0)
-        
-        seq = torch.cat([stacked_idx, response_tensor], dim=-1)
-        
-        resp_len = response_tensor.size(1)
-        delta_position_id = torch.arange(1, resp_len + 1, device=stacked_position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(total_rows, -1)
-        if stacked_position_ids.dim() == 3:
-            delta_position_id = delta_position_id.view(total_rows, 1, -1).expand(total_rows, 3, -1)
-        
-        response_position_ids = stacked_position_ids[..., -1:] + delta_position_id
-        full_position_ids = torch.cat([stacked_position_ids, response_position_ids], dim=-1)
-        
-        response_attention_mask = get_response_mask(
-            response_id=response_tensor, eos_token=eos_token_id, dtype=stacked_attention_mask.dtype
+        else:
+            vllm_inputs = [{"prompt_token_ids": list(raw)} for raw in non_tensor_batch.pop("raw_prompt_ids")]
+        for input_data in vllm_inputs:
+            input_data["prompt_token_ids"] = [int(t) for t in input_data["prompt_token_ids"]]
+
+        sampling_params = deepcopy(self.sampling_params)
+        sampling_params.n = 1
+        sampling_params.detokenize = False
+        sampling_params.output_kind = RequestOutputKind.DELTA
+
+        max_len = self.config.response_length
+
+        def answer_fn(token_ids):
+            # decode exactly the tokens the reward manager will see (see response_valid_length)
+            valid = response_valid_length(token_ids, eos_token_id, self.pad_token_id, max_len)
+            padded = list(token_ids) + [self.pad_token_id] * max(0, valid - len(token_ids))
+            text = tokenizer.decode(padded[:valid], skip_special_tokens=False)
+            return auto_extract(task, [text])[0]
+
+        scheduler = AdaPORolloutScheduler(
+            engine=self.inference_engine.llm_engine,
+            sampling_params=sampling_params,
+            answer_fn=answer_fn,
+            n_max=M,
+            n_min=n_samples_per_prompt,
+            adapo_config=AdaPOConfig.from_dict(adapo_config),
+            policy=policy,
+            lookahead=lookahead,
+            parallel_batch_size=parallel_batch_size,
         )
-        full_attention_mask = torch.cat((stacked_attention_mask, response_attention_mask), dim=-1)
-        
-        out_non_tensor = {}
+        results = scheduler.run(vllm_inputs)
+
+        responses, generated, generated_tokens, consumed, wallclock = [], [], [], [], []
+        for res in results:
+            for i in range(M):
+                tokens = res.token_ids[i]
+                responses.append(list(tokens) if tokens is not None else [])
+                generated.append(tokens is not None)
+                generated_tokens.append(res.generated_tokens[i])
+                consumed.append(i < res.num_consumed)
+                wallclock.append(res.wallclock)
+
+        response = pad_2d_list_to_length(responses, self.pad_token_id, max_length=max_len).to(idx.device)
+        idx = _repeat_interleave(idx, M)
+        attention_mask = _repeat_interleave(attention_mask, M)
+        position_ids = _repeat_interleave(position_ids, M)
         if "multi_modal_inputs" in non_tensor_batch:
-            expanded_mm = []
-            for p in range(num_prompts):
-                for _ in range(prompt_to_response_count[p]):
-                    expanded_mm.append(non_tensor_batch["multi_modal_inputs"][p])
-            out_non_tensor["multi_modal_inputs"] = np.array(expanded_mm, dtype=object)
-        
-        batch_dict = TensorDict(
+            non_tensor_batch["multi_modal_inputs"] = _repeat_interleave(non_tensor_batch["multi_modal_inputs"], M)
+        batch_size = idx.size(0)
+
+        seq = torch.cat([idx, response], dim=-1)
+        delta_position_id = torch.arange(1, response.size(1) + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+        response_position_ids = position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        generated_mask = torch.tensor(generated, device=response_attention_mask.device, dtype=response_attention_mask.dtype)
+        response_attention_mask = response_attention_mask * generated_mask.unsqueeze(-1)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        batch = TensorDict(
             {
-                "prompts": stacked_idx,
-                "responses": response_tensor,
+                "prompts": idx,
+                "responses": response,
                 "input_ids": seq,
-                "attention_mask": full_attention_mask,
-                "position_ids": full_position_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
             },
-            batch_size=total_rows,
+            batch_size=batch_size,
         )
-        
-        adaptive_info = {
-            "stopping_states": stopping_states,
-            "prompt_to_response_count": prompt_to_response_count,
-            "wallclock_per_prompt": wallclock_per_prompt,
-            "overall_wallclock": overall_wallclock,
-            "total_generated_per_prompt": total_generated_so_far,
-            "all_token_counts_per_prompt": all_token_counts_per_prompt,
-        }
-        
+        non_tensor_batch["adapo_generated"] = np.array(generated, dtype=bool)
+        non_tensor_batch["adapo_generated_tokens"] = np.array(generated_tokens, dtype=np.int64)
+        non_tensor_batch["adapo_consumed"] = np.array(consumed, dtype=bool)
+        non_tensor_batch["adapo_wallclock"] = np.array(wallclock, dtype=np.float64)
+
         if vllm_version in ("0.3.1", "0.4.2", "0.5.4", "0.6.3") and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
-        
-        return DataProto(batch=batch_dict, non_tensor_batch=out_non_tensor), adaptive_info
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
