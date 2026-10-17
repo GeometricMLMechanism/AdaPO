@@ -1,0 +1,28 @@
+# Tested with Python 3.10, CUDA 12.4.
+# Install torch + flash-attn first (see README), then: pip install -r requirements.txt && pip install -e .
+torch==2.6.0
+vllm==0.8.2
+flash-attn==2.7.4.post1
+transformers>=4.51,<4.57
+ray[default]>=2.40
+tensordict==0.6.2
+accelerate
+codetiming
+datasets
+dill
+hydra-core==1.3.2
+omegaconf==2.3.0
+liger-kernel
+numpy<2.0
+pandas
+peft
+pyarrow>=15.0.0
+pybind11
+torchdata
+wandb
+# answer extraction / verification
+latex2sympy2
+pylatexenc
+regex
+sympy==1.13.1
+word2number

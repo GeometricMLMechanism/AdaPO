@@ -1,0 +1,3 @@
+Copyright 2023-2024 Bytedance Ltd. and/or its affiliates (verl).
+Portions copyright the TTRL authors (https://github.com/PRIME-RL/TTRL).
+AdaPO modifications copyright 2026 the AdaPO authors.
