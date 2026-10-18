@@ -201,7 +201,7 @@ reward_model:
       gamma: 0.95 # posterior confidence for adaptive confirmation, Z*(gamma)
       eta: 0.6 # degradation factor: p_0 = eta * majority ratio of the first N rollouts (then frozen)
       min_num_candidates: 5 # lower bound on the number of candidate answers m
-      m_mode: dynamic # m = distinct answers so far (dynamic) or among the first N rollouts (frozen)
+      m_mode: frozen # m = distinct answers among the first N rollouts, then fixed (frozen) or re-estimated every rollout (dynamic)
     log_dir: ${trainer.default_local_dir}/adapo_logs # per-question JSON traces; null to disable
 
 custom_reward_function:

@@ -118,22 +118,7 @@ class TTRLRewardManager:
 
     @staticmethod
     def _confirmation_z_record(question_id, data_source, intermediate_info):
-        def last(key):
-            history = intermediate_info.get(key, [])
-            return history[-1] if history else 0
-
-        return {
-            "question_id": question_id,
-            "z_star_final": last("z_history"),
-            "z_history": intermediate_info.get("z_history", []),
-            "p0": last("p_history"),
-            "m_final": last("m_history"),
-            "m_history": intermediate_info.get("m_history", []),
-            "kappa_final": last("kappa_history"),
-            "kappa_history": intermediate_info.get("kappa_history", []),
-            "samples_used": intermediate_info.get("samples_used", 0),
-            "data_source": data_source,
-        }
+        return {"question_id": question_id, **intermediate_info, "data_source": data_source}
 
     def compute_post_ttrl_metrics(self, data: DataProto):
         """

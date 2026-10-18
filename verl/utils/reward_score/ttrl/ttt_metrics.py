@@ -20,8 +20,8 @@ class TokenTracker:
     epoch_samples = {}  # {epoch: [rollouts consumed per question]}
     epoch_val_metrics = {}  # {epoch: validation metrics}
     epoch_majority_ratios = {}  # {epoch: [majority ratio per question]}
-    epoch_z_star = {}  # {epoch: [Z*(gamma) per question]}
-    epoch_z_star_history = {}  # {epoch: [[Z*(gamma) per rollout] per question]}
+    epoch_z_star = {}  # {epoch: [Z*(gamma) per question, None if kappa <= 1]}
+    epoch_confirmations = {}  # {epoch: [confirmations collected when sampling ended, per question]}
     epoch_p_final = {}  # {epoch: [p_0 per question]}
     epoch_kappa_final = {}  # {epoch: [kappa per question]}
 
@@ -29,7 +29,7 @@ class TokenTracker:
         "epoch_samples",
         "epoch_majority_ratios",
         "epoch_z_star",
-        "epoch_z_star_history",
+        "epoch_confirmations",
         "epoch_p_final",
         "epoch_kappa_final",
     )
@@ -70,10 +70,10 @@ class TokenTracker:
         cls.total_question += 1
         cls._append("epoch_samples", samples_used)
         cls._append("epoch_majority_ratios", majority_ratio)
-        cls._append("epoch_z_star", rule.required_confirmations if rule.required_confirmations is not None else 1)
-        cls._append("epoch_z_star_history", list(rule.z_history))
+        cls._append("epoch_z_star", rule.required_confirmations)
+        cls._append("epoch_confirmations", rule.confirmations)
         cls._append("epoch_p_final", rule.p0 if rule.p0 is not None else 0.0)
-        cls._append("epoch_kappa_final", rule.kappa_history[-1] if rule.kappa_history else 0.0)
+        cls._append("epoch_kappa_final", rule.kappa if rule.kappa is not None else 0.0)
 
     @classmethod
     def save_all(cls, output_dir):
@@ -83,7 +83,7 @@ class TokenTracker:
             "epoch_val_metrics.json": cls.epoch_val_metrics,
             "epoch_majority_ratios.json": cls.epoch_majority_ratios,
             "epoch_z_star.json": cls.epoch_z_star,
-            "epoch_z_star_history.json": cls.epoch_z_star_history,
+            "epoch_confirmations.json": cls.epoch_confirmations,
             "epoch_p_final.json": cls.epoch_p_final,
             "epoch_kappa_final.json": cls.epoch_kappa_final,
         }
@@ -94,10 +94,10 @@ class TokenTracker:
 
     @classmethod
     def get_epoch_z_star_stats(cls, epoch=None):
-        """Mean / min / max / std of Z*(gamma) over the questions of an epoch."""
+        """Mean / min / max / std of Z*(gamma) over the questions of an epoch (questions with kappa <= 1 excluded)."""
         if epoch is None:
             epoch = cls.current_epoch
-        z_values = cls.epoch_z_star.get(epoch, [])
+        z_values = [z for z in cls.epoch_z_star.get(epoch, []) if z is not None]
         if not z_values:
             return {"mean": 0.0, "min": 0.0, "max": 0.0, "std": 0.0, "count": 0}
         mean_z = sum(z_values) / len(z_values)
@@ -159,13 +159,7 @@ def _adapo_metrics(rule: AdaPOStoppingRule, solutions, ground_truth, task, extra
     ttrl_metrics.update(_compute_extra_metrics(summary, ground_truth, task, extra_info))
 
     # Per-question trace saved to JSON by the trainer (not logged to wandb)
-    ttrl_metrics["_intermediate_info"] = {
-        "samples_used": samples_used,
-        "z_history": summary["z_history"],
-        "p_history": summary["p_history"],
-        "m_history": summary["m_history"],
-        "kappa_history": summary["kappa_history"],
-    }
+    ttrl_metrics["_intermediate_info"] = {k: summary[k] for k in ("samples_used", "stopped", "p0", "m", "kappa", "z_star", "confirmations", "first_trigger_index", "num_triggers", "num_returns_to_electing")}
     return rewards, ttrl_metrics
 
 
@@ -228,10 +222,9 @@ def test_time_train_metrics(
 def _compute_extra_metrics(summary, ground_truth, task, extra_info):
     """
     Diagnostics logged under ``extra/``: correctness of the answer after N rollouts and at each
-    confirmation round, and statistics of Z*(gamma), p_0, m and kappa during the rollout.
+    confirmation round, and the stopping-rule parameters p_0, m, kappa and Z*(gamma).
     """
     extra_metrics = {}
-    required_confirmations = summary["required_confirmations"]
 
     def is_correct(answer):
         if answer is None:
@@ -239,34 +232,19 @@ def _compute_extra_metrics(summary, ground_truth, task, extra_info):
         return 1.0 if auto_verify(task, [answer], [ground_truth], extra_info=extra_info)[0][0] else 0.0
 
     extra_metrics["extra/n_samples_correct"] = is_correct(summary["n_samples_answer"])
-    extra_metrics["extra/required_confirmations"] = float(required_confirmations)
-
-    z_history = summary["z_history"]
-    if z_history:
-        p_history, m_history, kappa_history = summary["p_history"], summary["m_history"], summary["kappa_history"]
-        extra_metrics["extra/z_star_final"] = float(z_history[-1])
-        extra_metrics["extra/z_star_mean"] = float(sum(z_history) / len(z_history))
-        extra_metrics["extra/z_star_max"] = float(max(z_history))
-        extra_metrics["extra/z_star_min"] = float(min(z_history))
-        extra_metrics["extra/z_star_initial"] = float(z_history[0])
-        extra_metrics["extra/p0"] = float(p_history[-1])
-        extra_metrics["extra/m_final"] = float(m_history[-1])
-        extra_metrics["extra/m_mean"] = float(sum(m_history) / len(m_history))
-        extra_metrics["extra/m_max"] = float(max(m_history))
-        extra_metrics["extra/kappa_final"] = float(kappa_history[-1])
-        extra_metrics["extra/kappa_mean"] = float(sum(kappa_history) / len(kappa_history))
-        extra_metrics["extra/kappa_max"] = float(max(kappa_history))
-        extra_metrics["extra/kappa_min"] = float(min(kappa_history))
-
-    confirmation_answers = summary["confirmation_answers"]
-    for round_num in range(1, required_confirmations + 1):
-        if round_num in confirmation_answers:
-            confirm_answer, confirm_samples = confirmation_answers[round_num]
-            extra_metrics[f"extra/confirm_{round_num}_correct"] = is_correct(confirm_answer)
-            extra_metrics[f"extra/confirm_{round_num}_samples_used"] = float(confirm_samples)
-        else:
-            extra_metrics[f"extra/confirm_{round_num}_correct"] = 0.0
-            extra_metrics[f"extra/confirm_{round_num}_samples_used"] = 0.0
+    extra_metrics["extra/p0"] = float(summary["p0"] or 0.0)
+    extra_metrics["extra/m"] = float(summary["m"] or 0)
+    extra_metrics["extra/kappa"] = float(summary["kappa"] or 0.0)
+    extra_metrics["extra/informative_kappa"] = 1.0 if summary["z_star"] is not None else 0.0  # kappa > 1
+    if summary["z_star"] is not None:  # undefined (the rule cannot trigger) when kappa <= 1
+        extra_metrics["extra/z_star"] = float(summary["z_star"])
+    # confirmations collected when sampling ended (= Z*(gamma) if the rule fired through Confirming)
+    extra_metrics["extra/confirmations"] = float(summary["confirmations"])
+    extra_metrics["extra/num_triggers"] = float(summary["num_triggers"])
+    extra_metrics["extra/num_returns_to_electing"] = float(summary["num_returns_to_electing"])
+    for round_num, (confirm_answer, confirm_samples) in summary["confirmation_answers"].items():
+        extra_metrics[f"extra/confirm_{round_num}_correct"] = is_correct(confirm_answer)
+        extra_metrics[f"extra/confirm_{round_num}_samples_used"] = float(confirm_samples)
 
     return extra_metrics
 

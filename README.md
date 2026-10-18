@@ -16,10 +16,10 @@ Test-time training methods such as [TTRL](https://github.com/PRIME-RL/TTRL) buil
 <p align="center"><img src="assets/flowchart.png" width="70%" alt="AdaPO state machine: Electing, Confirming, End"></p>
 
 * **Electing.** After a minimum of `N` rollouts, the leader `a_L` is triggered once its likelihood ratio against the runner-up `a_R`, `κ^(V(a_L) − V(a_R))`, reaches `A = (1−β)/α`.
-* **Confirming.** Each later rollout at which the trigger condition holds counts as one confirmation. Sampling stops once the leader has `Z*(γ)` confirmations, which bounds the posterior error of accepting it by `1−γ`.
+* **Confirming.** The trigger is the first confirmation of the triggered candidate `c`. Each later rollout at which `c` still dominates every other answer (likelihood ratio ≥ `A`) adds one confirmation; if its likelihood ratio drops below `B = β/(1−α)`, the rule returns to Electing. Sampling stops once `c` has `Z*(γ)` confirmations, which bounds the posterior error of accepting it by `1−γ`. With the defaults `α = β = 0.05, γ = 0.95`, `γ/(1−γ) = A`, so `Z*(γ) = 1` and sampling stops at the first trigger; raise `γ` (e.g. `--gamma 0.995`) for extra confirmation rounds.
 * **Update.** The pseudo-label from the stopping rule rewards the first `N` rollouts with `1[answer = pseudo-label]`, and those rollouts drive any policy-gradient algorithm (GRPO, PPO, REINFORCE++).
 
-Here `κ = p₀(m−1)/(1−p₀)`. The success probability `p₀` is estimated **once**, from the first `N` rollouts, as `η` × (leader's vote share). It is then held fixed for the rest of the rollout process.
+Here `κ = p₀(m−1)/(1−p₀)`. The success probability `p₀` is estimated **once**, from the first `N` rollouts, as `η` × (leader's vote share), and the number of candidates `m` as the number of distinct answers among them (at least 5). Both are then held fixed for the rest of the rollout process. If the first `N` (or more) rollouts all agree, sampling stops immediately.
 
 AdaPO saves over 40% of rollout tokens on GPQA at competitive accuracy.
 
@@ -132,6 +132,7 @@ reward_model:
       gamma: 0.95
       eta: 0.6                    # p_0 = eta * leader share of the first N rollouts (then frozen)
       min_num_candidates: 5       # lower bound on the number of candidate answers m
+      m_mode: frozen              # m from the first N rollouts (frozen) or re-estimated every rollout (dynamic)
     log_dir: ${trainer.default_local_dir}/adapo_logs
 ```
 
@@ -144,7 +145,7 @@ Training metrics go to the configured logger (wandb by default):
 * `timing_s/gen`: wall-clock time of the rollout phase per step
 * `train/adapo/samples_used`, `train/adapo/early_stopped`: rollouts consumed per prompt, and the fraction of prompts stopped before `M`
 * `train/label_accuracy`: accuracy of the AdaPO pseudo-labels (uses ground truth, logging only)
-* `train/extra/*`: `Z*(γ)`, `p₀`, `m`, `κ` statistics and per-confirmation-round label accuracy
+* `train/extra/*`: `p₀`, `m`, `κ`, `Z*(γ)` (averaged over questions with `κ > 1`; it is undefined otherwise), confirmations collected, Electing↔Confirming transitions, and per-confirmation-round label accuracy
 * `val/...`: mean@16 / pass@16 / pass@1 on the test set
 
 Per-question traces (extracted answers, `Z*`, `p₀`, `κ`, rollouts used) and per-epoch summaries are written as JSON to `<trainer.default_local_dir>/adapo_logs/`.
