@@ -2,11 +2,6 @@
 
 # AdaPO: Towards Principled Efficient Rollout Allocation in Test-Time Training
 
-**NeurIPS 2026**
-
-Youkang Wang, Jian Wang, Tianyi Zeng, Xiaoyong Wei, Qing Li
-<br>The Hong Kong Polytechnic University
-
 </div>
 
 Test-time training methods such as [TTRL](https://github.com/PRIME-RL/TTRL) build label-free rewards by majority voting over a **fixed, large** rollout budget for every query. Many queries reach consensus long before that budget is used up.
@@ -176,3 +171,5 @@ This code builds on [TTRL](https://github.com/PRIME-RL/TTRL) and [verl](https://
   year      = {2026}
 }
 ```
+
+> If you are a researcher wanting to open a PR or issue, please email us at yk2022.wang@connect.polyu.hk or cs007.wei@polyu.edu.hk with your GitHub username to be added as a collaborator.
